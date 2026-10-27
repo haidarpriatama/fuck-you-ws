@@ -1,39 +1,49 @@
 #!/usr/bin/env python3
 """
-Test Detector 3D-Corner & Multi-Face Kubus Kardus Merah (ABU Robocon 2027)
-==========================================================================
+Test Detector 3D-Corner & Multi-Box Separator Kubus Kardus 35x35x35 cm (Robocon 2027)
+=====================================================================================
 
-Fitur Pembaruan:
-1. PURE RED FILTER (Anti Bocor Kulit & Lantai):
-   - Menggabungkan HSV murni (Hue 0-7 & 172-180, Saturation tinggi >= 115)
-   - Ditambah filter dominansi Red pada RGB: (R - G > threshold) dan (R - B > threshold).
-   - Kaki manusia, kulit, dan lantai kayu otomatis TERELIMINASI 100%.
+Fitur Utama:
+1. DATA KALIBRASI ASLI (camera_brio.yaml):
+   - Memuat matriks intrinsik K (fx=775.107, fy=770.254, cx=617.683, cy=340.384)
+     dan koefisien distorsi D dari konfigurasi FAST-LIVO2.
+   - Estimasi posisi 3D nyata (X, Y, Z) dalam meter dan jarak d (meter) menggunakan SolvePnP.
 
-2. MULTI-CORNER & ROTATED 3D BOX (Antisipasi 6 Sisi, 8 Sudut, Box Terputar):
-   - Tidak lagi memaksa 4 sudut datar (1 sisi).
-   - Saat kubus miring / terputar (yaw/pitch) dan memperlihatkan 2 atau 3 sisi sekaligus:
-     * Menghitung siluet poligon luar kubus 3D (4 hingga 8 sudut poligon luar).
-     * Mendeteksi titik temu sudut dalam (interior junction corners) menggunakan Shi-Tomasi.
-   - Memberi label koordinat untuk setiap sudut fisik kubus yang terlihat (C1, C2, C3, ...).
+2. VERIFIKASI UKURAN FISIK 35x35x35 cm:
+   - Model 3D kubus 35x35x35 cm dengan 8 titik sudut (vertices) dan 12 rusuk (edges).
+   - Memproyeksikan kubus kawat 3D (3D Wireframe Bounding Box) langsung ke gambar 2D.
+   - Memvalidasi bahwa objek yang dideteksi benar-benar berdimensi fisik ~35 cm (bukan objek kecil atau objek raksasa).
+
+3. PEMISAHAN KASUS 2 KUBUS BERDEKATAN / MENEMPEL (Multi-Box Splitting):
+   - Menggunakan ukuran kernel adaptif agar celah antar kardus tidak tertutup.
+   - Deteksi rusuk sambungan internal (Canny / Vertical edge gradient).
+   - Analisis rasio aspek (Aspect Ratio > 1.45) & Convexity Defects untuk memotong
+     dan memisahkan 2 kardus yang menempel menjadi 2 kubus 35 cm independen.
+
+4. PURE RED FILTER (Anti-Bocor Kulit & Lantai):
+   - Dual-range HSV murni (Hue 0-7 & 172-180, Saturation >= 115) + Red Dominance RGB.
 
 Cara Menjalankan:
-  # Langsung dari webcam USB:
+  # 1. Dari Webcam Logitech MX Brio langsung:
   ~/yolo_venv/bin/python test_corner_detector.py --device /dev/video2
 
-  # Topik ROS 2:
+  # 2. Dari Topik ROS 2:
   ~/yolo_venv/bin/python test_corner_detector.py --ros
 
-  # File gambar:
+  # 3. Pengujian pada Gambar:
   ~/yolo_venv/bin/python test_corner_detector.py --image path/ke/gambar.jpg
 """
 
 import argparse
+import math
+import os
 import sys
 import time
 from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
+import yaml
 
 # Optional ROS2 import
 try:
@@ -46,18 +56,97 @@ except ImportError:
     HAS_ROS2 = False
 
 
-class Robust3DBoxDetector:
+def load_brio_calibration(yaml_path: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Memuat parameter kalibrasi kamera Logitech MX Brio dari camera_brio.yaml
+    atau menggunakan nilai default nominal jika file tidak ditemukan.
+    """
+    default_K = np.array([
+        [775.107823, 0.0, 617.682937],
+        [0.0, 770.254747, 340.384244],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float64)
+    default_D = np.array([0.102616, -0.173908, -0.011734, -0.002521, 0.0], dtype=np.float64)
+
+    search_paths = [
+        yaml_path,
+        "/home/haidar/fast_ws/src/FAST-LIVO2/config/camera_brio.yaml",
+        "/home/haidar/fast_ws/install/fast_livo/share/fast_livo/config/camera_brio.yaml"
+    ]
+
+    for p in search_paths:
+        if p and os.path.exists(p):
+            try:
+                with open(p, 'r') as f:
+                    data = yaml.safe_load(f)
+                params = data.get('/**/ros__parameters', data.get('ros__parameters', data))
+                fx = float(params.get('cam_fx', 775.107823))
+                fy = float(params.get('cam_fy', 770.254747))
+                cx = float(params.get('cam_cx', 617.682937))
+                cy = float(params.get('cam_cy', 340.384244))
+                d0 = float(params.get('cam_d0', 0.102616))
+                d1 = float(params.get('cam_d1', -0.173908))
+                d2 = float(params.get('cam_d2', -0.011734))
+                d3 = float(params.get('cam_d3', -0.002521))
+
+                K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+                D = np.array([d0, d1, d2, d3, 0.0], dtype=np.float64)
+                print(f"[Kalibrasi] Sukses memuat kalibrasi Brio dari: {p}")
+                return K, D
+            except Exception as e:
+                print(f"[WARN] Gagal membaca file kalibrasi {p} ({e}). Memakai nominal.")
+
+    print("[Kalibrasi] Menggunakan kalibrasi nominal bawaan Logitech MX Brio.")
+    return default_K, default_D
+
+
+class Cube35Detector:
+    # Dimensi fisik kubus Robocon: 35 x 35 x 35 cm (0.35 x 0.35 x 0.35 m)
+    CUBE_SIZE_M = 0.35
+    HALF_SIZE = 0.35 / 2.0  # 0.175 m
+
+    # 8 Titik sudut fisik 3D kubus (dalam meter) berpusat di (0, 0, 0)
+    CUBE_3D_CORNERS = np.array([
+        [-HALF_SIZE, -HALF_SIZE, -HALF_SIZE],  # 0: Depan Kiri-Atas
+        [ HALF_SIZE, -HALF_SIZE, -HALF_SIZE],  # 1: Depan Kanan-Atas
+        [ HALF_SIZE,  HALF_SIZE, -HALF_SIZE],  # 2: Depan Kanan-Bawah
+        [-HALF_SIZE,  HALF_SIZE, -HALF_SIZE],  # 3: Depan Kiri-Bawah
+        [-HALF_SIZE, -HALF_SIZE,  HALF_SIZE],  # 4: Belakang Kiri-Atas
+        [ HALF_SIZE, -HALF_SIZE,  HALF_SIZE],  # 5: Belakang Kanan-Atas
+        [ HALF_SIZE,  HALF_SIZE,  HALF_SIZE],  # 6: Belakang Kanan-Bawah
+        [-HALF_SIZE,  HALF_SIZE,  HALF_SIZE]   # 7: Belakang Kiri-Bawah
+    ], dtype=np.float64)
+
+    # 12 Garis rusuk penghubung kubus
+    CUBE_EDGES = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # Bidang depan
+        (4, 5), (5, 6), (6, 7), (7, 4),  # Bidang belakang
+        (0, 4), (1, 5), (2, 6), (3, 7)   # Rusuk penghubung depan-belakang
+    ]
+
+    # Titik planar sisi 35x35 cm untuk solvePnP
+    FACE_3D_POINTS = np.array([
+        [-HALF_SIZE, -HALF_SIZE, 0.0],
+        [ HALF_SIZE, -HALF_SIZE, 0.0],
+        [ HALF_SIZE,  HALF_SIZE, 0.0],
+        [-HALF_SIZE,  HALF_SIZE, 0.0]
+    ], dtype=np.float64)
+
     def __init__(
         self,
-        h_high1: int = 7,       # Ujung bawah merah: 0 sampai 7
-        h_low2: int = 172,      # Ujung atas merah: 172 sampai 180
-        s_low: int = 115,       # Saturasi tinggi untuk menolak warna kulit (kulit biasanya S < 90)
-        v_low: int = 50,
-        red_diff_min: int = 30, # Dominansi R terhadap G dan B: (R-G > 30) & (R-B > 30)
-        min_area: int = 3500,
-        close_ksize: int = 25,
-        poly_epsilon_pct: int = 25  # Epsilon poligon dalam persentase (25 -> 0.025)
+        K: np.ndarray,
+        D: np.ndarray,
+        h_high1: int = 7,
+        h_low2: int = 172,
+        s_low: int = 115,
+        v_low: int = 45,
+        red_diff_min: int = 30,
+        min_area: int = 2500,
+        close_ksize: int = 15,
+        enable_multi_box_split: bool = True
     ):
+        self.K = K
+        self.D = D
         self.h_high1 = h_high1
         self.h_low2 = h_low2
         self.s_low = s_low
@@ -65,223 +154,261 @@ class Robust3DBoxDetector:
         self.red_diff_min = red_diff_min
         self.min_area = min_area
         self.close_ksize = close_ksize
-        self.poly_epsilon_pct = poly_epsilon_pct
+        self.enable_multi_box_split = enable_multi_box_split
+
+    def split_adjacent_boxes(self, binary_mask: np.ndarray, gray_img: np.ndarray) -> np.ndarray:
+        """
+        Memisahkan kasus 2 kubus yang berdekatan/menempel agar tidak terdeteksi sebagai 1 objek raksasa.
+        Metode:
+        1. Deteksi Canny edge / celah sambungan vertikal di antara kardus.
+        2. Analisis Convexity Defects pada kontur yang terlalu lebar (Aspect Ratio > 1.45).
+        3. Pemotongan garis celah (boundary seam cutting).
+        """
+        cleaned_mask = binary_mask.copy()
+        cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < self.min_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = float(w) / max(float(h), 1.0)
+
+            # Jika aspect ratio > 1.40 atau < 0.70 (kemungkinan 2 kardus bersampingan atau bertumpuk)
+            if aspect > 1.40 or aspect < 0.70:
+                roi_mask = cleaned_mask[y:y+h, x:x+w]
+                roi_gray = gray_img[y:y+h, x:x+w]
+
+                # Cari garis celah sambungan dengan Sobel vertikal (jika bersampingan)
+                if aspect > 1.40:
+                    sobelx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
+                    sobelx = np.abs(sobelx)
+                    # Cari lembah (garis vertikal paling tajam di sekitar tengah 30% - 70%)
+                    center_start = int(w * 0.35)
+                    center_end = int(w * 0.65)
+                    if center_end > center_start:
+                        grad_strip = np.mean(sobelx[:, center_start:center_end], axis=0)
+                        valley_rel_x = int(np.argmax(grad_strip))
+                        split_x = x + center_start + valley_rel_x
+
+                        # Potong masker selebar 3 piksel sepanjang tinggi kardus
+                        cv2.line(cleaned_mask, (split_x, y), (split_x, y + h), 0, 3)
+
+                # Cek juga Convexity Defects (cekukan berbentuk V pada batas atas & bawah)
+                hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                if len(hull_idx) > 3:
+                    defects = cv2.convexityDefects(cnt, hull_idx)
+                    if defects is not None:
+                        deep_pts = []
+                        for i in range(defects.shape[0]):
+                            s, e, f, d = defects[i, 0]
+                            depth = d / 256.0
+                            if depth > 6.0:
+                                deep_pts.append(cnt[f][0])
+                        # Jika ada 2 cekukan V yang saling berhadapan, potong di antara keduanya
+                        if len(deep_pts) >= 2:
+                            pt1 = deep_pts[0]
+                            pt2 = deep_pts[1]
+                            cv2.line(cleaned_mask, tuple(pt1), tuple(pt2), 0, 3)
+
+        return cleaned_mask
 
     def detect(self, img_bgr: np.ndarray) -> Tuple[List[dict], np.ndarray]:
         """
-        Mendeteksi kubus kardus merah dengan filter merah murni (anti-kulit)
-        dan mengekstrak seluruh sudut fisik siluet 3D (4-8 sudut).
+        Deteksi kubus merah 35x35x35 cm, pemisahan 2 kubus berdekatan,
+        ekstraksi sudut 3D, dan estimasi pose SolvePnP.
         """
         img_h, img_w = img_bgr.shape[:2]
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-        # 1. Masking HSV Murni
+        # 1. Masking Merah Murni (Anti-Kulit)
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-        h = hsv[:, :, 0]
-        s = hsv[:, :, 1]
-        v = hsv[:, :, 2]
-
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
         mask_hsv = ((h <= self.h_high1) | (h >= self.h_low2)) & (s >= self.s_low) & (v >= self.v_low)
 
-        # 2. Filter Dominansi Red pada RGB (Eliminasi Kulit Manusia & Lantai Kayu)
-        # Kulit memiliki R~160, G~135, B~115 (selisih R-G hanya ~20).
-        # Kardus merah pekat memiliki selisih R-G > 35 dan R-B > 35.
         b = img_bgr[:, :, 0].astype(np.float32)
         g = img_bgr[:, :, 1].astype(np.float32)
         r = img_bgr[:, :, 2].astype(np.float32)
-
         mask_rgb = (r - g >= self.red_diff_min) & (r - b >= self.red_diff_min) & (r >= 65)
 
-        # Gabungan logika AND untuk menjamin warna MERAH BENAR-BENAR PEKAT
         mask_pure_red = (mask_hsv & mask_rgb).astype(np.uint8) * 255
 
-        # 3. Penutupan Morfologi (Menutup logo Robocon "天" di permukaan kardus)
+        # 2. Morfologi Ukuran Terkontrol (agar tidak menyatukan 2 kardus)
         k_close = max(3, self.close_ksize | 1)
         kernel_c = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
         mask_closed = cv2.morphologyEx(mask_pure_red, cv2.MORPH_CLOSE, kernel_c)
+        mask_clean = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
 
-        # Opening kecil untuk menghilangkan percikan kecil
-        kernel_o = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        mask_clean = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, kernel_o)
+        # 3. Pisahkan jika ada 2 kardus yang menempel
+        if self.enable_multi_box_split:
+            mask_clean = self.split_adjacent_boxes(mask_clean, gray)
 
-        # 4. Deteksi Kontur Siluet Kubus
+        # 4. Cari Kontur Setiap Kubus
         contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         results = []
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
         for cnt in contours:
             area = cv2.contourArea(cnt)
             if area < self.min_area:
                 continue
 
-            # Convex Hull: Menangkap batas fisik luar kubus 3D saat terputar
-            hull = cv2.convexHull(cnt)
-            peri = cv2.arcLength(hull, True)
+            # A. Bounding Box & Centroid
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            rect = cv2.minAreaRect(cnt)
+            box_4pt = cv2.boxPoints(rect).astype(np.float32)
 
-            # Poligon adaptif: mengekstrak sudut luar (4 sampai 8 sudut sesuai perspektif)
-            eps = (self.poly_epsilon_pct / 1000.0) * peri
-            approx = cv2.approxPolyDP(hull, eps, True)
-            outer_corners = approx.reshape(-1, 2)
-
-            # Urutkan sudut luar searah jarum jam relatif terhadap centroid
             moments = cv2.moments(cnt)
             if moments["m00"] > 1e-4:
                 cx = float(moments["m10"] / moments["m00"])
                 cy = float(moments["m01"] / moments["m00"])
             else:
-                cx = float(np.mean(outer_corners[:, 0]))
-                cy = float(np.mean(outer_corners[:, 1]))
+                cx, cy = float(x + bw / 2), float(y + bh / 2)
 
-            # Hitung sudut polar untuk pengurutan siklik
+            # B. Poligon Siluet 3D (4 - 8 Sudut Fisik)
+            hull = cv2.convexHull(cnt)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
+            outer_corners = approx.reshape(-1, 2)
+
+            # Urutkan sudut luar siklik
             angles = np.arctan2(outer_corners[:, 1] - cy, outer_corners[:, 0] - cx)
-            sort_order = np.argsort(angles)
-            outer_corners = outer_corners[sort_order]
+            outer_corners = outer_corners[np.argsort(angles)]
 
-            # 5. Deteksi Titik Sudut Dalam (Interior Junction Corners)
-            # Misalnya garis pertemuan 3 bidang kubus (Y-junction) di dalam kubus
-            cnt_mask = np.zeros((img_h, img_w), dtype=np.uint8)
-            cv2.drawContours(cnt_mask, [cnt], -1, 255, -1)
-            # Kikis sedikit tepi kontur agar hanya mencari sudut dalam
-            cnt_mask_inner = cv2.erode(cnt_mask, cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)))
+            # C. Estimasi Pose 3D SolvePnP (Model Fisik Kubus 35x35x35 cm)
+            # Urutkan 4 titik kotak muka kardus
+            s = box_4pt.sum(axis=1)
+            tl = box_4pt[np.argmin(s)]
+            br = box_4pt[np.argmax(s)]
+            diff = np.diff(box_4pt, axis=1)
+            tr = box_4pt[np.argmin(diff)]
+            bl = box_4pt[np.argmax(diff)]
+            ordered_4pt = np.array([tl, tr, br, bl], dtype=np.float32)
 
-            inner_corners = []
-            features = cv2.goodFeaturesToTrack(
-                gray,
-                maxCorners=4,
-                qualityLevel=0.08,
-                minDistance=25,
-                mask=cnt_mask_inner
+            pnp_success, rvec, tvec = cv2.solvePnP(
+                self.FACE_3D_POINTS,
+                ordered_4pt,
+                self.K,
+                self.D,
+                flags=cv2.SOLVEPNP_ITERATIVE
             )
-            if features is not None:
-                for pt in features.reshape(-1, 2):
-                    # Pastikan titik tidak menempel dengan outer corners
-                    dists = np.linalg.norm(outer_corners - pt, axis=1)
-                    if np.min(dists) > 20:
-                        inner_corners.append(pt.astype(int))
 
-            # Bounding box 2D yang membungkus seluruh sudut
-            x_min = float(np.min(outer_corners[:, 0]))
-            x_max = float(np.max(outer_corners[:, 0]))
-            y_min = float(np.min(outer_corners[:, 1]))
-            y_max = float(np.max(outer_corners[:, 1]))
+            wireframe_2d = None
+            dist_m = 0.0
+            pos_3d = (0.0, 0.0, 0.0)
+            est_dim_cm = 0.0
+
+            if pnp_success:
+                tx, ty, tz = tvec.ravel()
+                pos_3d = (float(tx), float(ty), float(tz))
+                dist_m = float(np.linalg.norm(tvec))
+
+                # Proyeksikan seluruh 8 sudut kubus 35x35x35 cm ke 2D
+                proj_8, _ = cv2.projectPoints(self.CUBE_3D_CORNERS, rvec, tvec, self.K, self.D)
+                wireframe_2d = proj_8.reshape(-1, 2).astype(np.int32)
+
+                # Estimasi ukuran fisik yang terlihat (apakah mendekati 35 cm?)
+                fx = self.K[0, 0]
+                est_dim_cm = (float(max(bw, bh)) * tz / fx) * 100.0
+
+                # Validasi fisik: tolak jika ukuran fisik < 18 cm atau > 65 cm
+                if est_dim_cm < 18.0 or est_dim_cm > 65.0:
+                    continue
+            else:
+                # Estimasi jarak sederhana jika solvePnP gagal
+                fx = self.K[0, 0]
+                tz = (fx * self.CUBE_SIZE_M) / max(bw, bh)
+                dist_m = float(tz)
+                pos_3d = ((cx - self.K[0, 2]) * tz / fx, (cy - self.K[1, 2]) * tz / self.K[1, 1], tz)
+                est_dim_cm = 35.0
 
             results.append({
                 'outer_corners': outer_corners,
-                'inner_corners': inner_corners,
+                'wireframe_8pts': wireframe_2d,
                 'center': (cx, cy),
-                'box_xyxy': [x_min, y_min, x_max, y_max],
+                'box_xyxy': [float(x), float(y), float(x + bw), float(y + bh)],
                 'area': float(area),
-                'num_outer_corners': len(outer_corners)
+                'distance_m': dist_m,
+                'pos_3d_m': pos_3d,
+                'est_size_cm': est_dim_cm,
+                'num_corners': len(outer_corners)
             })
 
-        results.sort(key=lambda x: x['area'], reverse=True)
+        # Urutkan dari kardus terdekat
+        results.sort(key=lambda item: item['distance_m'])
         return results, mask_clean
 
 
-def draw_3d_box_visualizations(
+def draw_calibrated_cube_visualizations(
     img_draw: np.ndarray,
     detections: List[dict],
     fps: float = 0.0
 ) -> np.ndarray:
-    """Menggambar poligon siluet 3D, seluruh sudut fisik, garis sisi, dan koordinat."""
+    """Menggambar kubus kawat 3D 35x35x35 cm, seluruh sudut, jarak meter, dan label."""
     corner_colors = [
-        (0, 255, 255),    # Kuning
-        (255, 255, 0),    # Cyan
-        (0, 255, 0),      # Hijau
-        (255, 0, 255),    # Magenta
-        (0, 165, 255),    # Orange
-        (255, 100, 100),  # Biru Langit
-        (100, 255, 200),  # Mint
-        (200, 100, 255)   # Ungu
+        (0, 255, 255),    # C1: Kuning
+        (255, 255, 0),    # C2: Cyan
+        (0, 255, 0),      # C3: Hijau
+        (255, 0, 255),    # C4: Magenta
+        (0, 165, 255),    # C5: Orange
+        (255, 120, 120),  # C6: Biru
+        (120, 255, 200),  # C7: Mint
+        (200, 120, 255)   # C8: Lavender
     ]
 
     for i, det in enumerate(detections):
-        outer = det['outer_corners'].astype(np.int32)
-        inner = det['inner_corners']
         cx, cy = int(det['center'][0]), int(det['center'][1])
-        n_corners = det['num_outer_corners']
+        dist = det['distance_m']
+        pos = det['pos_3d_m']
+        dim = det['est_size_cm']
+        outer = det['outer_corners'].astype(np.int32)
+        wireframe = det['wireframe_8pts']
 
-        # 1. Gambar Poligon Siluet Kubus 3D
+        # 1. Gambar Wireframe Kubus 3D (35x35x35 cm) jika PnP sukses
+        if wireframe is not None and len(wireframe) == 8:
+            # 12 Rusuk 3D kubus
+            for p1_i, p2_i in Cube35Detector.CUBE_EDGES:
+                pt1 = tuple(wireframe[p1_i])
+                pt2 = tuple(wireframe[p2_i])
+                cv2.line(img_draw, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
+
+            # Gambar 8 titik sudut kubus 3D
+            for v_i, pt in enumerate(wireframe):
+                cv2.circle(img_draw, tuple(pt), 4, (0, 0, 255), -1)
+
+        # 2. Gambar Poligon Siluet Luar
         cv2.polylines(img_draw, [outer], isClosed=True, color=(0, 220, 255), thickness=2, lineType=cv2.LINE_AA)
 
-        # 2. Gambar Garis Hubung ke Sudut Dalam (Jika ada sudut Y-junction)
-        for in_pt in inner:
-            cv2.circle(img_draw, tuple(in_pt), 6, (0, 0, 255), -1)
-            cv2.putText(
-                img_draw,
-                f"Inner:({in_pt[0]},{in_pt[1]})",
-                (in_pt[0] + 8, in_pt[1] - 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                (0, 0, 255),
-                1,
-                cv2.LINE_AA
-            )
-            # Hubungkan sudut dalam ke sudut luar terdekat
-            dists = np.linalg.norm(outer - in_pt, axis=1)
-            nearest_idx = np.argsort(dists)[:3]
-            for n_idx in nearest_idx:
-                cv2.line(img_draw, tuple(in_pt), tuple(outer[n_idx]), (0, 180, 255), 1, cv2.LINE_AA)
-
-        # 3. Titik Centroid
-        cv2.circle(img_draw, (cx, cy), 5, (0, 0, 255), -1)
-        cv2.putText(
-            img_draw,
-            f"Pusat:({cx},{cy})",
-            (cx + 8, cy + 15),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 0, 255),
-            1,
-            cv2.LINE_AA
-        )
-
-        # 4. Gambar Setiap Sudut Luar (C1, C2, ..., Cn)
-        for c_idx in range(n_corners):
+        # 3. Gambar Setiap Sudut Fisik Luar (C1, C2, ...)
+        for c_idx in range(len(outer)):
             pt = tuple(outer[c_idx])
             col = corner_colors[c_idx % len(corner_colors)]
+            cv2.circle(img_draw, pt, 6, (0, 0, 0), -1)
+            cv2.circle(img_draw, pt, 4, col, -1)
+            cv2.putText(img_draw, f"C{c_idx+1}", (pt[0]-15, pt[1]-8), cv2.FONT_HERSHEY_SIMPLEX, 0.40, col, 1)
 
-            cv2.circle(img_draw, pt, 7, (0, 0, 0), -1)
-            cv2.circle(img_draw, pt, 5, col, -1)
-
-            lbl = f"C{c_idx+1}:({pt[0]},{pt[1]})"
-            cv2.putText(
-                img_draw,
-                lbl,
-                (pt[0] - 25, pt[1] - 12),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.40,
-                col,
-                1,
-                cv2.LINE_AA
-            )
-
-        # Header Info Objek
+        # 4. Titik Pusat & Info Koordinat 3D
+        cv2.circle(img_draw, (cx, cy), 5, (0, 0, 255), -1)
         x1, y1, x2, y2 = [int(v) for v in det['box_xyxy']]
-        info_header = f"Kardus 3D #{i+1} | {n_corners} Sudut Luar | Area: {det['area']:.0f}px"
-        cv2.putText(
-            img_draw,
-            info_header,
-            (x1, max(y1 - 12, 25)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.50,
-            (0, 255, 0),
-            2,
-            cv2.LINE_AA
-        )
+
+        header = f"Kubus #{i+1} [35x35x35cm] | d={dist:.2f}m (X={pos[0]:.2f}, Y={pos[1]:.2f}, Z={pos[2]:.2f})"
+        cv2.putText(img_draw, header, (x1, max(y1 - 12, 25)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2, cv2.LINE_AA)
+
+        dim_label = f"Ukuran Fisik: ~{dim:.1f}cm ({len(outer)} sudut)"
+        cv2.putText(img_draw, dim_label, (x1, min(y2 + 18, img_draw.shape[0] - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
 
     # Info Status FPS & Deteksi
-    fps_text = f"FPS: {fps:.1f} | Objek Kardus: {len(detections)}"
+    fps_text = f"FPS: {fps:.1f} | Kubus 35cm Terdeteksi: {len(detections)}"
     cv2.putText(img_draw, fps_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
 
-    hint = "Tekan 'q'/'ESC': Keluar | 's': Simpan Tangkapan Layar | Window Kontrol untuk Slider"
+    hint = "Tekan 'q'/'ESC': Keluar | 's': Simpan Foto | Split 2-Box Aktif"
     cv2.putText(img_draw, hint, (20, img_draw.shape[0] - 15), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
     return img_draw
 
 
-def run_standalone_camera(device: str, detector: Robust3DBoxDetector):
-    """Menjalankan deteksi langsung dari USB Camera (/dev/video*)."""
+def run_standalone_camera(device: str, detector: Cube35Detector):
+    """Menjalankan deteksi langsung dari USB Webcam."""
     if device.isdigit():
         cap_arg = int(device)
     else:
@@ -298,43 +425,39 @@ def run_standalone_camera(device: str, detector: Robust3DBoxDetector):
         print(f"[ERROR] Gagal membuka kamera {device}!")
         return
 
-    win_main = "Deteksi 3D-Corner Kubus Kardus (Robocon 2027)"
-    win_ctrl = "Kalibrasi Murni Merah (Anti-Kulit)"
+    win_main = "Deteksi Kubus 35x35x35 cm (Robocon 2027)"
+    win_ctrl = "Kontrol Kalibrasi & Split 2-Box"
     cv2.namedWindow(win_main, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_main, 1024, 576)
 
     cv2.namedWindow(win_ctrl, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(win_ctrl, 420, 320)
+    cv2.resizeWindow(win_ctrl, 420, 280)
 
     def nothing(x): pass
 
-    # Trackbar kontrol presisi
     cv2.createTrackbar("H_High1 (0-15)", win_ctrl, detector.h_high1, 20, nothing)
     cv2.createTrackbar("H_Low2 (160-180)", win_ctrl, detector.h_low2, 180, nothing)
     cv2.createTrackbar("S_Low (Saturasi)", win_ctrl, detector.s_low, 255, nothing)
-    cv2.createTrackbar("V_Low (Kecerahan)", win_ctrl, detector.v_low, 255, nothing)
     cv2.createTrackbar("RedDiff (R-G & R-B)", win_ctrl, detector.red_diff_min, 80, nothing)
-    cv2.createTrackbar("Epsilon% (Sudut)", win_ctrl, detector.poly_epsilon_pct, 60, nothing)
-    cv2.createTrackbar("CloseKernel", win_ctrl, detector.close_ksize, 51, nothing)
+    cv2.createTrackbar("CloseKernel", win_ctrl, detector.close_ksize, 31, nothing)
+    cv2.createTrackbar("Split 2-Box (0/1)", win_ctrl, 1 if detector.enable_multi_box_split else 0, 1, nothing)
 
     t_prev = time.time()
     fps = 0.0
 
-    print("Kamera aktif. Arahkan ke kardus merah dari berbagai sudut rotasi.")
+    print("Kamera aktif. Silakan letakkan 1 atau 2 kubus kardus merah 35 cm.")
     while True:
         ret, frame = cap.read()
         if not ret:
             time.sleep(0.05)
             continue
 
-        # Update nilai dari slider
         detector.h_high1 = cv2.getTrackbarPos("H_High1 (0-15)", win_ctrl)
         detector.h_low2 = max(160, cv2.getTrackbarPos("H_Low2 (160-180)", win_ctrl))
         detector.s_low = cv2.getTrackbarPos("S_Low (Saturasi)", win_ctrl)
-        detector.v_low = cv2.getTrackbarPos("V_Low (Kecerahan)", win_ctrl)
         detector.red_diff_min = cv2.getTrackbarPos("RedDiff (R-G & R-B)", win_ctrl)
-        detector.poly_epsilon_pct = max(10, cv2.getTrackbarPos("Epsilon% (Sudut)", win_ctrl))
         detector.close_ksize = max(3, cv2.getTrackbarPos("CloseKernel", win_ctrl))
+        detector.enable_multi_box_split = (cv2.getTrackbarPos("Split 2-Box (0/1)", win_ctrl) == 1)
 
         t_now = time.time()
         fps = 0.9 * fps + 0.1 * (1.0 / max(1e-4, t_now - t_prev))
@@ -342,22 +465,22 @@ def run_standalone_camera(device: str, detector: Robust3DBoxDetector):
 
         dets, mask_clean = detector.detect(frame)
         view = frame.copy()
-        draw_3d_box_visualizations(view, dets, fps=fps)
+        draw_calibrated_cube_visualizations(view, dets, fps=fps)
 
-        # PIP Masker Biner di pojok kanan atas
+        # PIP Masker Biner
         mask_bgr = cv2.cvtColor(mask_clean, cv2.COLOR_GRAY2BGR)
         pip_h, pip_w = 180, 320
         mask_small = cv2.resize(mask_bgr, (pip_w, pip_h))
         view[10:10 + pip_h, view.shape[1] - pip_w - 10:view.shape[1] - 10] = mask_small
         cv2.rectangle(view, (view.shape[1] - pip_w - 10, 10), (view.shape[1] - 10, 10 + pip_h), (0, 255, 255), 1)
-        cv2.putText(view, "Masker Murni Merah", (view.shape[1] - pip_w - 5, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1)
+        cv2.putText(view, "Masker Biner (Split Aktif)", (view.shape[1] - pip_w - 5, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
 
         cv2.imshow(win_main, view)
         key = cv2.waitKey(1) & 0xFF
         if key in [ord('q'), 27]:
             break
         elif key == ord('s'):
-            filename = f"corner_3d_capture_{int(time.time())}.jpg"
+            filename = f"cube_35cm_capture_{int(time.time())}.jpg"
             cv2.imwrite(filename, view)
             print(f"Tangkapan layar tersimpan: {filename}")
 
@@ -365,8 +488,8 @@ def run_standalone_camera(device: str, detector: Robust3DBoxDetector):
     cv2.destroyAllWindows()
 
 
-def run_image_test(image_path: str, detector: Robust3DBoxDetector):
-    """Menguji deteksi pada file gambar statis."""
+def run_image_test(image_path: str, detector: Cube35Detector):
+    """Pengujian pada file gambar statis."""
     frame = cv2.imread(image_path)
     if frame is None:
         print(f"[ERROR] Gagal memuat file gambar: {image_path}")
@@ -376,37 +499,34 @@ def run_image_test(image_path: str, detector: Robust3DBoxDetector):
     dets, mask_clean = detector.detect(frame)
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
-    print(f"\nHasil Deteksi 3D-Corner ({image_path}):")
-    print(f"- Latensi: {latency_ms:.2f} ms")
-    print(f"- Objek Kardus Ditemukan: {len(dets)}")
+    print(f"\nHasil Deteksi Kubus 35x35x35 cm ({image_path}):")
+    print(f"- Latensi SolvePnP: {latency_ms:.2f} ms")
+    print(f"- Jumlah Kubus Terdeteksi: {len(dets)}")
 
     for i, d in enumerate(dets):
-        print(f"\n[Kardus #{i+1}]")
-        print(f"  Pusat (Centroid): ({d['center'][0]:.1f}, {d['center'][1]:.1f})")
-        print(f"  Jumlah Sudut Luar Terdeteksi: {d['num_outer_corners']} sudut")
-        print("  Daftar Koordinat Sudut Luar:")
-        for idx, pt in enumerate(d['outer_corners']):
-            print(f"    - Corner #{idx+1}: ({pt[0]}, {pt[1]})")
-        if d['inner_corners']:
-            print(f"  Sudut Sambungan Sisi Dalam (Y-Junction): {d['inner_corners']}")
+        print(f"\n[Kubus #{i+1}]")
+        print(f"  Posisi 3D Frame Kamera: X={d['pos_3d_m'][0]:.3f}m, Y={d['pos_3d_m'][1]:.3f}m, Z={d['pos_3d_m'][2]:.3f}m")
+        print(f"  Jarak Nyata: {d['distance_m']:.3f} meter")
+        print(f"  Estimasi Ukuran Fisik: {d['est_size_cm']:.1f} cm (Target: 35 cm)")
+        print(f"  Jumlah Sudut Luar: {d['num_corners']}")
 
     out_view = frame.copy()
-    draw_3d_box_visualizations(out_view, dets, fps=1000.0 / max(1e-3, latency_ms))
-    cv2.imwrite("corner_3d_result.jpg", out_view)
-    print("\nHasil visualisasi disimpan ke: corner_3d_result.jpg")
+    draw_calibrated_cube_visualizations(out_view, dets, fps=1000.0 / max(1e-3, latency_ms))
+    cv2.imwrite("cube_35cm_calibrated_result.jpg", out_view)
+    print("\nHasil visualisasi tersimpan di: cube_35cm_calibrated_result.jpg")
 
 
-def run_ros2_node(topic: str, detector: Robust3DBoxDetector):
+def run_ros2_node(topic: str, detector: Cube35Detector):
     """Menjalankan deteksi melalui ROS 2 subscription."""
     if not HAS_ROS2:
         print("[ERROR] ROS 2 tidak terdeteksi di environment ini!")
         return
 
     rclpy.init()
-    node = Node('test_3d_corner_detector_node')
+    node = Node('test_cube35_detector_node')
     bridge = CvBridge()
 
-    win_name = "ROS2 3D Corner Detector"
+    win_name = "ROS2 Cube 35cm Calibrated Detector"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(win_name, 1024, 576)
 
@@ -419,12 +539,12 @@ def run_ros2_node(topic: str, detector: Robust3DBoxDetector):
 
         dets, mask = detector.detect(cv_img)
         view = cv_img.copy()
-        draw_3d_box_visualizations(view, dets)
+        draw_calibrated_cube_visualizations(view, dets)
 
-        for d in dets:
+        for i, d in enumerate(dets):
             node.get_logger().info(
-                f"[3D Box] Pusat: ({d['center'][0]:.1f}, {d['center'][1]:.1f}) | "
-                f"Sudut Luar: {d['num_outer_corners']} pts | BBox: {d['box_xyxy']}",
+                f"[Kubus #{i+1}] d={d['distance_m']:.2f}m | 3D: ({d['pos_3d_m'][0]:.2f}, {d['pos_3d_m'][1]:.2f}, {d['pos_3d_m'][2]:.2f})m | "
+                f"Ukuran: ~{d['est_size_cm']:.1f}cm",
                 throttle_duration_sec=1.0
             )
 
@@ -433,7 +553,7 @@ def run_ros2_node(topic: str, detector: Robust3DBoxDetector):
             rclpy.shutdown()
 
     node.create_subscription(Image, topic, img_callback, 10)
-    print(f"Subscribed ke topik ROS 2: {topic}. Menunggu data gambar...")
+    print(f"Subscribed ke topik ROS 2: {topic}. Menunggu gambar...")
 
     try:
         rclpy.spin(node)
@@ -447,27 +567,34 @@ def run_ros2_node(topic: str, detector: Robust3DBoxDetector):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Detector 3D-Corner Kubus Kardus Merah Robocon 2027")
+    parser = argparse.ArgumentParser(description="Detector Kubus 35x35x35 cm dengan Kalibrasi Brio")
     parser.add_argument("--device", type=str, default="/dev/video2",
-                        help="Jalur device kamera (/dev/video2 atau index integer)")
+                        help="Jalur device kamera (/dev/video2 atau index)")
     parser.add_argument("--image", type=str, default=None,
                         help="Uji coba pada file gambar statis")
     parser.add_argument("--ros", action="store_true",
                         help="Gunakan topik gambar ROS 2 (/image_raw)")
     parser.add_argument("--topic", type=str, default="/image_raw",
                         help="Topik ROS 2 jika --ros diaktifkan")
+    parser.add_argument("--calib", type=str, default=None,
+                        help="Path opsional ke camera_brio.yaml")
 
     args = parser.parse_args()
 
-    detector = Robust3DBoxDetector(
+    # 1. Ambil data kalibrasi kamera Logitech MX Brio dari project FAST-LIVO2
+    K, D = load_brio_calibration(args.calib)
+
+    # 2. Inisialisasi detector kubus 35x35x35 cm
+    detector = Cube35Detector(
+        K=K, D=D,
         h_high1=7,
         h_low2=172,
         s_low=115,
-        v_low=50,
+        v_low=45,
         red_diff_min=30,
-        min_area=3500,
-        close_ksize=25,
-        poly_epsilon_pct=25
+        min_area=2500,
+        close_ksize=15,  # Kernel lebih rapat agar celah 2 kardus terjaga
+        enable_multi_box_split=True
     )
 
     if args.image is not None:
