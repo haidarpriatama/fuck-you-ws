@@ -362,24 +362,11 @@ def draw_calibrated_cube_visualizations(
         pos = det['pos_3d_m']
         dim = det['est_size_cm']
         outer = det['outer_corners'].astype(np.int32)
-        wireframe = det['wireframe_8pts']
 
-        # 1. Gambar Wireframe Kubus 3D (35x35x35 cm) jika PnP sukses
-        if wireframe is not None and len(wireframe) == 8:
-            # 12 Rusuk 3D kubus
-            for p1_i, p2_i in Cube35Detector.CUBE_EDGES:
-                pt1 = tuple(wireframe[p1_i])
-                pt2 = tuple(wireframe[p2_i])
-                cv2.line(img_draw, pt1, pt2, (0, 255, 0), 2, cv2.LINE_AA)
-
-            # Gambar 8 titik sudut kubus 3D
-            for v_i, pt in enumerate(wireframe):
-                cv2.circle(img_draw, tuple(pt), 4, (0, 0, 255), -1)
-
-        # 2. Gambar Poligon Siluet Luar
+        # 1. Gambar Poligon Siluet Luar Kuning (mengikuti sudut fisik kubus 3D)
         cv2.polylines(img_draw, [outer], isClosed=True, color=(0, 220, 255), thickness=2, lineType=cv2.LINE_AA)
 
-        # 3. Gambar Setiap Sudut Fisik Luar (C1, C2, ...)
+        # 2. Gambar Setiap Sudut Fisik Luar (C1, C2, ...)
         for c_idx in range(len(outer)):
             pt = tuple(outer[c_idx])
             col = corner_colors[c_idx % len(corner_colors)]

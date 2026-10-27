@@ -11,10 +11,15 @@
     # -------------------------------------------------------------
     # PENGATURAN DETEKTOR
     # -------------------------------------------------------------
-    detector: "yolo"                      # Opsi: 'yolo' atau 'hsv'
+    detector: "corner"                    # Opsi: 'corner' (klasik 35x35x35 cm tanpa AI), 'yolo', atau 'hsv'
     model: "/home/haidar/ros2_ws/models/best11n.pt"
-    target_class: "R"                     # Kelas target: 'R' (Red box)
-    conf: 0.20                            # Ambang batas kepercayaan deteksi YOLO (disesuaikan untuk kubus berlogo)
+    target_class: "R"                     # Kelas target YOLO: 'R' (Red box)
+    conf: 0.20                            # Ambang batas kepercayaan deteksi YOLO
+
+    # Pengaturan Khusus Corner Detector & Multi-Box Split:
+    enable_multi_box_split: true          # Otomatis pisahkan 2 kardus jika berdampingan/menempel
+    s_low: 115                            # Batas bawah saturasi (menolak kulit manusia S < 100)
+    red_diff_min: 30                      # Batas dominansi merah RGB: (R-G > 30 & R-B > 30)
 
     # -------------------------------------------------------------
     # TOPIK DAN FRAME

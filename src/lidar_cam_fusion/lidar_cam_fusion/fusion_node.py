@@ -85,6 +85,196 @@ except ImportError:
     HAS_YOLO = False
 
 
+class Cube35Detector:
+    """
+    Detector Klasik Khusus Kubus Kardus 35x35x35 cm (ABU Robocon 2027)
+    - Pure Red Filter (Dual-range HSV + RGB difference R-G > 30, R-B > 30 untuk tolak warna kulit/kaki)
+    - Pemisahan 2 kubus yang berdekatan/menempel (Sobel vertical cut & convexity defects)
+    - Poligon 3D siluet kubus terputar (4 sampai 8 sudut luar)
+    - Validasi ukuran fisik ~35 cm dengan SolvePnP
+    """
+    CUBE_SIZE_M = 0.35
+    HALF_SIZE = 0.35 / 2.0
+
+    FACE_3D_POINTS = np.array([
+        [-HALF_SIZE, -HALF_SIZE, 0.0],
+        [ HALF_SIZE, -HALF_SIZE, 0.0],
+        [ HALF_SIZE,  HALF_SIZE, 0.0],
+        [-HALF_SIZE,  HALF_SIZE, 0.0]
+    ], dtype=np.float64)
+
+    def __init__(
+        self,
+        K: np.ndarray,
+        D: np.ndarray,
+        h_high1: int = 7,
+        h_low2: int = 172,
+        s_low: int = 115,
+        v_low: int = 45,
+        red_diff_min: int = 30,
+        min_area: int = 2500,
+        close_ksize: int = 15,
+        enable_multi_box_split: bool = True
+    ):
+        self.K = K
+        self.D = D
+        self.h_high1 = h_high1
+        self.h_low2 = h_low2
+        self.s_low = s_low
+        self.v_low = v_low
+        self.red_diff_min = red_diff_min
+        self.min_area = min_area
+        self.close_ksize = close_ksize
+        self.enable_multi_box_split = enable_multi_box_split
+
+    def split_adjacent_boxes(self, binary_mask: np.ndarray, gray_img: np.ndarray) -> np.ndarray:
+        """Memisahkan 2 kubus yang berdekatan/menempel."""
+        cleaned_mask = binary_mask.copy()
+        cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if area < self.min_area:
+                continue
+
+            x, y, w, h = cv2.boundingRect(cnt)
+            aspect = float(w) / max(float(h), 1.0)
+
+            # Jika aspect ratio > 1.40 atau < 0.70 (indikasi 2 kubus menyatu)
+            if aspect > 1.40 or aspect < 0.70:
+                roi_gray = gray_img[y:y+h, x:x+w]
+                if aspect > 1.40:
+                    sobelx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
+                    sobelx = np.abs(sobelx)
+                    center_start = int(w * 0.35)
+                    center_end = int(w * 0.65)
+                    if center_end > center_start:
+                        grad_strip = np.mean(sobelx[:, center_start:center_end], axis=0)
+                        valley_rel_x = int(np.argmax(grad_strip))
+                        split_x = x + center_start + valley_rel_x
+                        cv2.line(cleaned_mask, (split_x, y), (split_x, y + h), 0, 3)
+
+                hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                if len(hull_idx) > 3:
+                    defects = cv2.convexityDefects(cnt, hull_idx)
+                    if defects is not None:
+                        deep_pts = []
+                        for i in range(defects.shape[0]):
+                            s, e, f, d = defects[i, 0]
+                            depth = d / 256.0
+                            if depth > 6.0:
+                                deep_pts.append(cnt[f][0])
+                        if len(deep_pts) >= 2:
+                            cv2.line(cleaned_mask, tuple(deep_pts[0]), tuple(deep_pts[1]), 0, 3)
+
+        return cleaned_mask
+
+    def detect(self, img_bgr: np.ndarray) -> Tuple[List[dict], np.ndarray]:
+        img_h, img_w = img_bgr.shape[:2]
+        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+        # 1. Masking Pure Red
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        h, s, v = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+        mask_hsv = ((h <= self.h_high1) | (h >= self.h_low2)) & (s >= self.s_low) & (v >= self.v_low)
+
+        b = img_bgr[:, :, 0].astype(np.float32)
+        g = img_bgr[:, :, 1].astype(np.float32)
+        r = img_bgr[:, :, 2].astype(np.float32)
+        mask_rgb = (r - g >= self.red_diff_min) & (r - b >= self.red_diff_min) & (r >= 65)
+
+        mask_pure_red = (mask_hsv & mask_rgb).astype(np.uint8) * 255
+
+        # 2. Morfologi penutup celah logo
+        k_close = max(3, self.close_ksize | 1)
+        kernel_c = cv2.getStructuringElement(cv2.MORPH_RECT, (k_close, k_close))
+        mask_closed = cv2.morphologyEx(mask_pure_red, cv2.MORPH_CLOSE, kernel_c)
+        mask_clean = cv2.morphologyEx(mask_closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)))
+
+        # 3. Pisahkan jika ada 2 kubus menempel
+        if self.enable_multi_box_split:
+            mask_clean = self.split_adjacent_boxes(mask_clean, gray)
+
+        contours, _ = cv2.findContours(mask_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        results = []
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < self.min_area:
+                continue
+
+            x, y, bw, bh = cv2.boundingRect(cnt)
+            rect = cv2.minAreaRect(cnt)
+            box_4pt = cv2.boxPoints(rect).astype(np.float32)
+
+            moments = cv2.moments(cnt)
+            if moments["m00"] > 1e-4:
+                cx = float(moments["m10"] / moments["m00"])
+                cy = float(moments["m01"] / moments["m00"])
+            else:
+                cx, cy = float(x + bw / 2), float(y + bh / 2)
+
+            # Poligon siluet kubus 3D
+            hull = cv2.convexHull(cnt)
+            peri = cv2.arcLength(hull, True)
+            approx = cv2.approxPolyDP(hull, 0.025 * peri, True)
+            outer_corners = approx.reshape(-1, 2)
+
+            angles = np.arctan2(outer_corners[:, 1] - cy, outer_corners[:, 0] - cx)
+            outer_corners = outer_corners[np.argsort(angles)]
+
+            # SolvePnP untuk estimasi jarak dan validasi fisik ~35 cm
+            s = box_4pt.sum(axis=1)
+            tl = box_4pt[np.argmin(s)]
+            br = box_4pt[np.argmax(s)]
+            diff = np.diff(box_4pt, axis=1)
+            tr = box_4pt[np.argmin(diff)]
+            bl = box_4pt[np.argmax(diff)]
+            ordered_4pt = np.array([tl, tr, br, bl], dtype=np.float32)
+
+            pnp_success, rvec, tvec = cv2.solvePnP(
+                self.FACE_3D_POINTS,
+                ordered_4pt,
+                self.K,
+                self.D,
+                flags=cv2.SOLVEPNP_ITERATIVE
+            )
+
+            dist_m = 0.0
+            pos_3d = (0.0, 0.0, 0.0)
+            est_dim_cm = 35.0
+
+            if pnp_success:
+                tx, ty, tz = tvec.ravel()
+                pos_3d = (float(tx), float(ty), float(tz))
+                dist_m = float(np.linalg.norm(tvec))
+                fx = self.K[0, 0]
+                est_dim_cm = (float(max(bw, bh)) * tz / fx) * 100.0
+
+                # Validasi fisik: tolak jika bukan mendekati ukuran kardus (18-65 cm)
+                if est_dim_cm < 18.0 or est_dim_cm > 65.0:
+                    continue
+            else:
+                fx = self.K[0, 0]
+                tz = (fx * self.CUBE_SIZE_M) / max(bw, bh)
+                dist_m = float(tz)
+                pos_3d = ((cx - self.K[0, 2]) * tz / fx, (cy - self.K[1, 2]) * tz / self.K[1, 1], tz)
+
+            results.append({
+                'outer_corners': outer_corners,
+                'center': (cx, cy),
+                'box_xyxy': [float(x), float(y), float(x + bw), float(y + bh)],
+                'area': float(area),
+                'distance_m': dist_m,
+                'pos_3d_m': pos_3d,
+                'est_size_cm': est_dim_cm,
+                'num_corners': len(outer_corners)
+            })
+
+        results.sort(key=lambda item: item['distance_m'])
+        return results, mask_clean
+
+
 class LidarCamFusionNode(Node):
     def __init__(self):
         super().__init__('lidar_cam_fusion_node')
@@ -116,6 +306,11 @@ class LidarCamFusionNode(Node):
         self.declare_parameter('min_pts', 3)    # Toleransi titik minimum (default 3)
         self.declare_parameter('max_extent', 0.50)
         self.declare_parameter('min_range', 0.35)  # Blind zone Livox Mid-360 & sasis robot
+
+        # Parameter Detektor Corner 3D & Split 2-Box
+        self.declare_parameter('enable_multi_box_split', True)
+        self.declare_parameter('s_low', 115)
+        self.declare_parameter('red_diff_min', 30)
 
         # Parameter Sudut Kemiringan LiDAR ke Bawah (Pitch Angle dalam derajat)
         # Positif (+) jika LiDAR dimiringkan menunduk ke bawah
@@ -234,6 +429,9 @@ class LidarCamFusionNode(Node):
         self.min_pts = self.get_parameter('min_pts').get_parameter_value().integer_value
         self.max_extent = self.get_parameter('max_extent').get_parameter_value().double_value
         self.min_range = self.get_parameter('min_range').get_parameter_value().double_value
+        self.enable_multi_box_split = self.get_parameter('enable_multi_box_split').get_parameter_value().bool_value
+        self.s_low = self.get_parameter('s_low').get_parameter_value().integer_value
+        self.red_diff_min = self.get_parameter('red_diff_min').get_parameter_value().integer_value
         self.lidar_pitch_deg = self.get_parameter('lidar_pitch_deg').get_parameter_value().double_value
 
         # Matriks K (3x3)
@@ -281,9 +479,22 @@ class LidarCamFusionNode(Node):
         )
 
     def init_detector(self):
-        """Inisialisasi YOLO atau fallback HSV."""
+        """Inisialisasi Detektor (Corner 3D, YOLO, atau fallback HSV)."""
         self.yolo_model = None
+        self.cube_detector = None
         self.device = 'cpu'
+
+        if self.detector_type in ['corner', 'corner3d']:
+            self.get_logger().info("Menginisialisasi Detektor Klasik 3D-Corner Kubus 35x35x35 cm...")
+            self.cube_detector = Cube35Detector(
+                K=self.K,
+                D=self.D,
+                s_low=self.s_low,
+                red_diff_min=self.red_diff_min,
+                enable_multi_box_split=self.enable_multi_box_split
+            )
+            self.get_logger().info("Cube35Detector aktif (Pure Red + Anti-Kulit + Multi-Box Split).")
+            return
 
         if self.detector_type == 'yolo':
             if not HAS_YOLO:
@@ -382,16 +593,31 @@ class LidarCamFusionNode(Node):
             box = bbox_data['box']
             label = bbox_data['label']
             score = bbox_data['score']
+            poly = bbox_data.get('polygon', None)
 
             shrunk_box = self.compute_shrunk_box(box, self.shrink, img_w, img_h)
 
             x1, y1, x2, y2 = [int(v) for v in box]
-            sx1, sy1, sx2, sy2 = [int(v) for v in shrunk_box]
-            cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.rectangle(debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 255), 1)
+
+            if poly is not None and len(poly) >= 3:
+                # Gambar Poligon Siluet 3D Kuning & Titik Sudut (tanpa wireframe kubus hijau)
+                outer_pts = poly.astype(np.int32)
+                cv2.polylines(debug_img, [outer_pts], isClosed=True, color=(0, 220, 255), thickness=2, lineType=cv2.LINE_AA)
+                for c_idx, pt in enumerate(outer_pts):
+                    cv2.circle(debug_img, tuple(pt), 5, (0, 0, 0), -1)
+                    cv2.circle(debug_img, tuple(pt), 3, (0, 255, 255), -1)
+                    cv2.putText(debug_img, f"C{c_idx+1}", (pt[0]-14, pt[1]-7), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1)
+
+                if 'center' in bbox_data:
+                    cx, cy = int(bbox_data['center'][0]), int(bbox_data['center'][1])
+                    cv2.circle(debug_img, (cx, cy), 4, (0, 0, 255), -1)
+            else:
+                sx1, sy1, sx2, sy2 = [int(v) for v in shrunk_box]
+                cv2.rectangle(debug_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.rectangle(debug_img, (sx1, sy1), (sx2, sy2), (0, 255, 255), 1)
 
             cluster_cam_pts, cluster_uv, raw_in_box_count = self.extract_cluster_in_box(
-                pts_cam, proj_uv, shrunk_box, self.gap, self.min_pts, self.max_extent, self.min_range
+                pts_cam, proj_uv, shrunk_box, self.gap, self.min_pts, self.max_extent, self.min_range, polygon=poly
             )
 
             if cluster_cam_pts is not None and len(cluster_cam_pts) >= self.min_pts:
@@ -415,10 +641,10 @@ class LidarCamFusionNode(Node):
                     if 0 <= u < img_w and 0 <= v < img_h:
                         cv2.circle(debug_img, (u, v), 3, (0, 255, 0), -1)
 
-                info_text = f"{label} {score:.2f} | d={dist:.2f}m (x={obj_x:.2f}, y={obj_y:.2f}, z={obj_z:.2f}) [{len(cluster_cam_pts)}pts]"
-                cv2.putText(debug_img, info_text, (x1, max(y1 - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                info_text = f"{label} [35cm] | d={dist:.2f}m (x={obj_x:.2f}, y={obj_y:.2f}, z={obj_z:.2f}) [{len(cluster_cam_pts)}pts]"
+                cv2.putText(debug_img, info_text, (x1, max(y1 - 10, 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 2, cv2.LINE_AA)
             else:
-                info_text = f"{label} {score:.2f} | NO LIDAR CLUSTER ({raw_in_box_count} pts)"
+                info_text = f"{label} | NO LIDAR CLUSTER ({raw_in_box_count} pts)"
                 cv2.putText(debug_img, info_text, (x1, max(y1 - 8, 20)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1, cv2.LINE_AA)
                 self.get_logger().info(
                     f"[{label}] Target terdeteksi di gambar ({raw_in_box_count} titik LiDAR valid dalam box), "
@@ -469,9 +695,27 @@ class LidarCamFusionNode(Node):
                     self.gui_warned = True
 
     def detect_objects(self, img_bgr: np.ndarray) -> Tuple[List[dict], float]:
-        """Deteksi 2D dengan YOLO atau fallback HSV."""
+        """Deteksi 2D dengan Corner 3D, YOLO, atau fallback HSV."""
         results = []
         latency_ms = -1.0
+
+        if self.detector_type in ['corner', 'corner3d'] and self.cube_detector is not None:
+            t0 = time.perf_counter()
+            dets, mask_clean = self.cube_detector.detect(img_bgr)
+            latency_ms = (time.perf_counter() - t0) * 1000.0
+
+            for d in dets:
+                results.append({
+                    'box': d['box_xyxy'],
+                    'label': 'Cube35',
+                    'score': 1.0,
+                    'polygon': d['outer_corners'],
+                    'center': d['center'],
+                    'est_size_cm': d['est_size_cm'],
+                    'pnp_dist': d['distance_m'],
+                    'pnp_pos': d['pos_3d_m']
+                })
+            return results, latency_ms
 
         if self.detector_type == 'yolo' and self.yolo_model is not None:
             t0 = time.perf_counter()
@@ -582,15 +826,16 @@ class LidarCamFusionNode(Node):
         gap: float = 0.25,
         min_pts: int = 3,
         max_extent: float = 0.50,
-        min_range: float = 0.35
+        min_range: float = 0.35,
+        polygon: Optional[np.ndarray] = None
     ) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], int]:
         """
-        Ekstraksi dan klasterisasi titik 3D dalam 2D bounding box berdasarkan metodologi:
+        Ekstraksi dan klasterisasi titik 3D dalam 2D bounding box / poligon berdasarkan metodologi:
         - Darshan Bhanushali (LiDAR-Camera Fusion for 3D Object Detection)
         - Jeremy Cohen / Fritz AI (LiDAR and Camera Fusion in Self-Driving Cars)
         
         Langkah:
-        1. ROI BBox Filtering & Blind Spot Rejection (Z < min_range).
+        1. ROI BBox/Polygon Filtering & Blind Spot Rejection (Z < min_range).
         2. 1D Depth Clustering dengan batas toleransi selisih jarak (gap).
         3. Eliminasi kluster noise (< min_pts).
         4. Seleksi kluster target foreground terdekat yang valid.
@@ -600,11 +845,25 @@ class LidarCamFusionNode(Node):
             return None, None, 0
 
         sx1, sy1, sx2, sy2 = shrunk_box
-        inside_mask = (
-            (proj_uv[:, 0] >= sx1) & (proj_uv[:, 0] <= sx2) &
-            (proj_uv[:, 1] >= sy1) & (proj_uv[:, 1] <= sy2) &
-            (pts_cam[:, 2] >= min_range)  # Filter blind zone / chassis noise
-        )
+
+        # Prioritaskan poligon 3D siluet jika tersedia
+        inside_mask = None
+        if polygon is not None and len(polygon) >= 3:
+            poly_f32 = polygon.astype(np.float32)
+            in_poly = np.array([
+                cv2.pointPolygonTest(poly_f32, (float(uv[0]), float(uv[1])), False) >= 0
+                for uv in proj_uv
+            ], dtype=bool)
+            test_mask = in_poly & (pts_cam[:, 2] >= min_range)
+            if np.count_nonzero(test_mask) >= min_pts:
+                inside_mask = test_mask
+
+        if inside_mask is None:
+            inside_mask = (
+                (proj_uv[:, 0] >= sx1) & (proj_uv[:, 0] <= sx2) &
+                (proj_uv[:, 1] >= sy1) & (proj_uv[:, 1] <= sy2) &
+                (pts_cam[:, 2] >= min_range)  # Filter blind zone / chassis noise
+            )
 
         pts_in_box = pts_cam[inside_mask]
         uv_in_box = proj_uv[inside_mask]
