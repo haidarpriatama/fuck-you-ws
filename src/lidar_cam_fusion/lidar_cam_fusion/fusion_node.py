@@ -59,7 +59,14 @@ except ImportError:
 try:
     from livox_ros_driver2.msg import CustomMsg
 except ImportError:
-    CustomMsg = None
+    # Fallback jika user lupa source ws_livox di terminal ini
+    livox_py_dir = '/home/haidar/ws_livox/install/livox_ros_driver2/local/lib/python3.10/dist-packages'
+    if os.path.exists(livox_py_dir) and livox_py_dir not in sys.path:
+        sys.path.append(livox_py_dir)
+    try:
+        from livox_ros_driver2.msg import CustomMsg
+    except ImportError:
+        CustomMsg = None
 
 # TF2 imports
 try:

@@ -14,7 +14,7 @@
     detector: "yolo"                      # Opsi: 'yolo' atau 'hsv'
     model: "/home/haidar/ros2_ws/models/best11n.pt"
     target_class: "R"                     # Kelas target: 'R' (Red box)
-    conf: 0.45                            # Ambang batas kepercayaan deteksi YOLO
+    conf: 0.20                            # Ambang batas kepercayaan deteksi YOLO (disesuaikan untuk kubus berlogo)
 
     # -------------------------------------------------------------
     # TOPIK DAN FRAME
