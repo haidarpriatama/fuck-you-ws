@@ -177,6 +177,37 @@ class TestFusionAlgorithms(unittest.TestCase):
         # Pastikan noise dekat Z < 0.35m TIDAK masuk
         self.assertTrue(np.all(selected_pts[:, 2] >= 0.35), "Noise dekat tidak boleh masuk!")
 
+    def test_lidar_fov_clipping(self):
+        """Memverifikasi bahwa titik LiDAR di luar FOV kamera dipotong secara tepat."""
+        class DummyNode:
+            def __init__(self, K, D, R_cl, t_cl, min_range):
+                self.K = K
+                self.D = D
+                self.R_cl = R_cl
+                self.t_cl = t_cl
+                self.min_range = min_range
+            project_lidar_to_camera = LidarCamFusionNode.project_lidar_to_camera
+
+        dummy = DummyNode(self.K, self.D, self.R_cl, self.t_cl, min_range=0.35)
+
+        # Titik 1: Di depan pas di tengah (Z_c = 2.0m, tepat di tengah gambar [640, 360])
+        p1 = [2.0, 0.0, 0.0]
+
+        # Titik 2: Di belakang robot (Z_c = -2.0m -> harus dieliminasi)
+        p2 = [-2.0, 0.0, 0.0]
+
+        # Titik 3: Jauh di samping kiri (di luar HFOV -> harus dieliminasi)
+        p3 = [1.0, 3.0, 0.0]
+
+        pts_lidar = np.array([p1, p2, p3], dtype=np.float64)
+        pts_cam_fov, proj_uv_fov, in_fov, pts_lidar_fov = dummy.project_lidar_to_camera(pts_lidar, 1280, 720)
+
+        self.assertEqual(len(pts_cam_fov), 1, "Hanya 1 titik (tengah) yang boleh lolos FOV kamera!")
+        self.assertAlmostEqual(proj_uv_fov[0][0], self.cx, delta=1.0)
+        self.assertAlmostEqual(proj_uv_fov[0][1], self.cy, delta=1.0)
+        self.assertTrue(0 <= proj_uv_fov[0][0] < 1280)
+        self.assertTrue(0 <= proj_uv_fov[0][1] < 720)
+
 
 if __name__ == '__main__':
     unittest.main()
