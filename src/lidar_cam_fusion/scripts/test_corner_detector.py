@@ -158,59 +158,94 @@ class Cube35Detector:
 
     def split_adjacent_boxes(self, binary_mask: np.ndarray, gray_img: np.ndarray) -> np.ndarray:
         """
-        Memisahkan kasus 2 kubus yang berdekatan/menempel agar tidak terdeteksi sebagai 1 objek raksasa.
-        Metode:
-        1. Deteksi Canny edge / celah sambungan vertikal di antara kardus.
-        2. Analisis Convexity Defects pada kontur yang terlalu lebar (Aspect Ratio > 1.45).
-        3. Pemotongan garis celah (boundary seam cutting).
+        Memisahkan kasus 2 atau lebih kubus yang berdekatan/menempel/bertumpuk:
+        - Bersampingan horizontal (Aspect ratio W/H > 1.35)
+        - Bertumpuk vertikal (Aspect ratio H/W > 1.25)
+        Menggunakan Sobel seam detection dan pemotongan tembus penuh selebar 5 px.
         """
         cleaned_mask = binary_mask.copy()
-        cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_h, mask_w = cleaned_mask.shape[:2]
 
-        for cnt in cnts:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
-                continue
+        # Lakukan maksimal 2 pass pemotongan untuk menangani hingga 3 tumpukan kardus
+        for _ in range(2):
+            cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            split_occurred = False
 
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect = float(w) / max(float(h), 1.0)
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                if area < self.min_area:
+                    continue
 
-            # Jika aspect ratio > 1.40 atau < 0.70 (kemungkinan 2 kardus bersampingan atau bertumpuk)
-            if aspect > 1.40 or aspect < 0.70:
-                roi_mask = cleaned_mask[y:y+h, x:x+w]
-                roi_gray = gray_img[y:y+h, x:x+w]
+                x, y, w, h = cv2.boundingRect(cnt)
+                ratio_w_h = float(w) / max(float(h), 1.0)
+                ratio_h_w = float(h) / max(float(w), 1.0)
 
-                # Cari garis celah sambungan dengan Sobel vertikal (jika bersampingan)
-                if aspect > 1.40:
+                # Kasus 1: Kardus BERSAMPINGAN (Horizontal, W >> H)
+                if ratio_w_h > 1.35:
+                    roi_gray = gray_img[y:y+h, x:x+w]
                     sobelx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
                     sobelx = np.abs(sobelx)
-                    # Cari lembah (garis vertikal paling tajam di sekitar tengah 30% - 70%)
                     center_start = int(w * 0.35)
                     center_end = int(w * 0.65)
+                    split_x = x + w // 2
                     if center_end > center_start:
                         grad_strip = np.mean(sobelx[:, center_start:center_end], axis=0)
-                        valley_rel_x = int(np.argmax(grad_strip))
-                        split_x = x + center_start + valley_rel_x
+                        if np.max(grad_strip) > 5.0:
+                            split_x = x + center_start + int(np.argmax(grad_strip))
 
-                        # Potong masker selebar 3 piksel sepanjang tinggi kardus
-                        cv2.line(cleaned_mask, (split_x, y), (split_x, y + h), 0, 3)
+                    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                    if len(hull_idx) > 3:
+                        defects = cv2.convexityDefects(cnt, hull_idx)
+                        if defects is not None:
+                            deep_pts = [
+                                cnt[defects[i, 0][2]][0]
+                                for i in range(defects.shape[0])
+                                if (defects[i, 0][3] / 256.0) > 4.0
+                                and (x + 0.30 * w <= cnt[defects[i, 0][2]][0][0] <= x + 0.70 * w)
+                            ]
+                            if len(deep_pts) >= 1:
+                                split_x = int(np.mean([p[0] for p in deep_pts]))
 
-                # Cek juga Convexity Defects (cekukan berbentuk V pada batas atas & bawah)
-                hull_idx = cv2.convexHull(cnt, returnPoints=False)
-                if len(hull_idx) > 3:
-                    defects = cv2.convexityDefects(cnt, hull_idx)
-                    if defects is not None:
-                        deep_pts = []
-                        for i in range(defects.shape[0]):
-                            s, e, f, d = defects[i, 0]
-                            depth = d / 256.0
-                            if depth > 6.0:
-                                deep_pts.append(cnt[f][0])
-                        # Jika ada 2 cekukan V yang saling berhadapan, potong di antara keduanya
-                        if len(deep_pts) >= 2:
-                            pt1 = deep_pts[0]
-                            pt2 = deep_pts[1]
-                            cv2.line(cleaned_mask, tuple(pt1), tuple(pt2), 0, 3)
+                    # Potong vertikal menembus bounding box (thickness 5 px)
+                    y_top = max(0, y - 5)
+                    y_bot = min(mask_h - 1, y + h + 5)
+                    cv2.line(cleaned_mask, (split_x, y_top), (split_x, y_bot), 0, 5)
+                    split_occurred = True
+
+                # Kasus 2: Kardus BERTUMPUK (Vertikal, H >> W)
+                elif ratio_h_w > 1.25:
+                    roi_gray = gray_img[y:y+h, x:x+w]
+                    sobely = cv2.Sobel(roi_gray, cv2.CV_32F, 0, 1, ksize=3)
+                    sobely = np.abs(sobely)
+                    center_start = int(h * 0.35)
+                    center_end = int(h * 0.65)
+                    split_y = y + h // 2
+                    if center_end > center_start:
+                        grad_strip = np.mean(sobely[center_start:center_end, :], axis=1)
+                        if np.max(grad_strip) > 5.0:
+                            split_y = y + center_start + int(np.argmax(grad_strip))
+
+                    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                    if len(hull_idx) > 3:
+                        defects = cv2.convexityDefects(cnt, hull_idx)
+                        if defects is not None:
+                            deep_pts = [
+                                cnt[defects[i, 0][2]][0]
+                                for i in range(defects.shape[0])
+                                if (defects[i, 0][3] / 256.0) > 4.0
+                                and (y + 0.30 * h <= cnt[defects[i, 0][2]][0][1] <= y + 0.70 * h)
+                            ]
+                            if len(deep_pts) >= 1:
+                                split_y = int(np.mean([p[1] for p in deep_pts]))
+
+                    # Potong horizontal menembus bounding box (thickness 5 px)
+                    x_left = max(0, x - 5)
+                    x_right = min(mask_w - 1, x + w + 5)
+                    cv2.line(cleaned_mask, (x_left, split_y), (x_right, split_y), 0, 5)
+                    split_occurred = True
+
+            if not split_occurred:
+                break
 
         return cleaned_mask
 

@@ -21,3 +21,8 @@ env/
 .vscode/*.db*
 .vscode/*.lock
 .vscode/ipch/
+
+# ==========================================
+# TEMPORARY TEST IMAGES
+# ==========================================
+*.png

@@ -34,6 +34,7 @@
     # PREVIEW & VISUALISASI
     # -------------------------------------------------------------
     show_preview: false                   # Matikan jendela pop-up OpenCV GUI (fokus visualisasi di RViz2)
+    render_lidar_overlay: false           # Matikan overlay titik 2D di /fusion/debug agar FPS tinggi & tidak lag (PointCloud 3D tetap tayang di RViz)
 
     # -------------------------------------------------------------
     # BUFFER & AKUMULASI SCAN

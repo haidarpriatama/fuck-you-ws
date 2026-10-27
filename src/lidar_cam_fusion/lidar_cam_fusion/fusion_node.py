@@ -128,44 +128,95 @@ class Cube35Detector:
         self.enable_multi_box_split = enable_multi_box_split
 
     def split_adjacent_boxes(self, binary_mask: np.ndarray, gray_img: np.ndarray) -> np.ndarray:
-        """Memisahkan 2 kubus yang berdekatan/menempel."""
+        """
+        Memisahkan kasus 2 atau lebih kubus yang berdekatan/menempel/bertumpuk:
+        - Bersampingan horizontal (Aspect ratio W/H > 1.35)
+        - Bertumpuk vertikal (Aspect ratio H/W > 1.25)
+        Menggunakan Sobel seam detection dan pemotongan tembus penuh selebar 5 px.
+        """
         cleaned_mask = binary_mask.copy()
-        cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        mask_h, mask_w = cleaned_mask.shape[:2]
 
-        for cnt in cnts:
-            area = cv2.contourArea(cnt)
-            if area < self.min_area:
-                continue
+        # Lakukan maksimal 2 pass pemotongan untuk menangani hingga 3 tumpukan kardus
+        for _ in range(2):
+            cnts, _ = cv2.findContours(cleaned_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            split_occurred = False
 
-            x, y, w, h = cv2.boundingRect(cnt)
-            aspect = float(w) / max(float(h), 1.0)
+            for cnt in cnts:
+                area = cv2.contourArea(cnt)
+                if area < self.min_area:
+                    continue
 
-            # Jika aspect ratio > 1.40 atau < 0.70 (indikasi 2 kubus menyatu)
-            if aspect > 1.40 or aspect < 0.70:
-                roi_gray = gray_img[y:y+h, x:x+w]
-                if aspect > 1.40:
+                x, y, w, h = cv2.boundingRect(cnt)
+                ratio_w_h = float(w) / max(float(h), 1.0)
+                ratio_h_w = float(h) / max(float(w), 1.0)
+
+                # Kasus 1: Kardus BERSAMPINGAN (Horizontal, W >> H)
+                if ratio_w_h > 1.35:
+                    roi_gray = gray_img[y:y+h, x:x+w]
                     sobelx = cv2.Sobel(roi_gray, cv2.CV_32F, 1, 0, ksize=3)
                     sobelx = np.abs(sobelx)
                     center_start = int(w * 0.35)
                     center_end = int(w * 0.65)
+                    split_x = x + w // 2
                     if center_end > center_start:
                         grad_strip = np.mean(sobelx[:, center_start:center_end], axis=0)
-                        valley_rel_x = int(np.argmax(grad_strip))
-                        split_x = x + center_start + valley_rel_x
-                        cv2.line(cleaned_mask, (split_x, y), (split_x, y + h), 0, 3)
+                        if np.max(grad_strip) > 5.0:
+                            split_x = x + center_start + int(np.argmax(grad_strip))
 
-                hull_idx = cv2.convexHull(cnt, returnPoints=False)
-                if len(hull_idx) > 3:
-                    defects = cv2.convexityDefects(cnt, hull_idx)
-                    if defects is not None:
-                        deep_pts = []
-                        for i in range(defects.shape[0]):
-                            s, e, f, d = defects[i, 0]
-                            depth = d / 256.0
-                            if depth > 6.0:
-                                deep_pts.append(cnt[f][0])
-                        if len(deep_pts) >= 2:
-                            cv2.line(cleaned_mask, tuple(deep_pts[0]), tuple(deep_pts[1]), 0, 3)
+                    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                    if len(hull_idx) > 3:
+                        defects = cv2.convexityDefects(cnt, hull_idx)
+                        if defects is not None:
+                            deep_pts = [
+                                cnt[defects[i, 0][2]][0]
+                                for i in range(defects.shape[0])
+                                if (defects[i, 0][3] / 256.0) > 4.0
+                                and (x + 0.30 * w <= cnt[defects[i, 0][2]][0][0] <= x + 0.70 * w)
+                            ]
+                            if len(deep_pts) >= 1:
+                                split_x = int(np.mean([p[0] for p in deep_pts]))
+
+                    # Potong vertikal menembus bounding box (thickness 5 px)
+                    y_top = max(0, y - 5)
+                    y_bot = min(mask_h - 1, y + h + 5)
+                    cv2.line(cleaned_mask, (split_x, y_top), (split_x, y_bot), 0, 5)
+                    split_occurred = True
+
+                # Kasus 2: Kardus BERTUMPUK (Vertikal, H >> W)
+                elif ratio_h_w > 1.25:
+                    roi_gray = gray_img[y:y+h, x:x+w]
+                    sobely = cv2.Sobel(roi_gray, cv2.CV_32F, 0, 1, ksize=3)
+                    sobely = np.abs(sobely)
+                    center_start = int(h * 0.35)
+                    center_end = int(h * 0.65)
+                    split_y = y + h // 2
+                    if center_end > center_start:
+                        grad_strip = np.mean(sobely[center_start:center_end, :], axis=1)
+                        if np.max(grad_strip) > 5.0:
+                            split_y = y + center_start + int(np.argmax(grad_strip))
+
+                    hull_idx = cv2.convexHull(cnt, returnPoints=False)
+                    if len(hull_idx) > 3:
+                        defects = cv2.convexityDefects(cnt, hull_idx)
+                        if defects is not None:
+                            deep_pts = [
+                                cnt[defects[i, 0][2]][0]
+                                for i in range(defects.shape[0])
+                                if (defects[i, 0][3] / 256.0) > 4.0
+                                and (y + 0.30 * h <= cnt[defects[i, 0][2]][0][1] <= y + 0.70 * h)
+                            ]
+                            if len(deep_pts) >= 1:
+                                split_y = int(np.mean([p[1] for p in deep_pts]))
+
+                    # Potong horizontal menembus bounding box (thickness 5 px)
+                    x_left = max(0, x - 5)
+                    x_right = min(mask_w - 1, x + w + 5)
+                    cv2.line(cleaned_mask, (x_left, split_y), (x_right, split_y), 0, 5)
+                    split_occurred = True
+
+            if not split_occurred:
+                break
 
         return cleaned_mask
 
@@ -296,6 +347,10 @@ class LidarCamFusionNode(Node):
         # Default: False agar tidak memunculkan window popup baru, visualisasi fokus di RViz
         self.declare_parameter('show_preview', False)
 
+        # Visual Overlay: Default False agar tidak lag memproses ribuan cv2.circle titik pointcloud pada gambar
+        # PointCloud 3D tetap dipublikasikan ke RViz secara hardware-accelerated (/fusion/roi_cloud & /fusion/cluster_cloud)
+        self.declare_parameter('render_lidar_overlay', False)
+
         # Waktu akumulasi titik (dinaikkan ke 0.45s agar kerapatan scan Livox Mid-360 cukup rapat)
         self.declare_parameter('window_s', 0.45)
         self.declare_parameter('time_offset', 0.0)
@@ -421,6 +476,7 @@ class LidarCamFusionNode(Node):
         self.enable_tf = self.get_parameter('enable_tf').get_parameter_value().bool_value
 
         self.show_preview = self.get_parameter('show_preview').get_parameter_value().bool_value
+        self.render_lidar_overlay = self.get_parameter('render_lidar_overlay').get_parameter_value().bool_value
 
         self.window_s = self.get_parameter('window_s').get_parameter_value().double_value
         self.time_offset = self.get_parameter('time_offset').get_parameter_value().double_value
@@ -578,8 +634,8 @@ class LidarCamFusionNode(Node):
 
         debug_img = cv_img.copy()
 
-        # Render titik LiDAR yang masuk FOV kamera (biru muda)
-        if proj_uv is not None and len(proj_uv) > 0:
+        # Render titik LiDAR yang masuk FOV kamera (biru muda) - hanya jika render_lidar_overlay diaktifkan
+        if self.render_lidar_overlay and proj_uv is not None and len(proj_uv) > 0:
             for pt_uv in proj_uv:
                 u, v = int(round(pt_uv[0])), int(round(pt_uv[1]))
                 if 0 <= u < img_w and 0 <= v < img_h:
@@ -635,11 +691,12 @@ class LidarCamFusionNode(Node):
                 })
                 cluster_all_pts.append(cluster_cam_pts)
 
-                # Highlight titik kluster objek (hijau terang)
-                for c_uv in cluster_uv:
-                    u, v = int(round(c_uv[0])), int(round(c_uv[1]))
-                    if 0 <= u < img_w and 0 <= v < img_h:
-                        cv2.circle(debug_img, (u, v), 3, (0, 255, 0), -1)
+                # Highlight titik kluster objek (hijau terang) - hanya jika render_lidar_overlay aktif
+                if self.render_lidar_overlay and cluster_uv is not None:
+                    for c_uv in cluster_uv:
+                        u, v = int(round(c_uv[0])), int(round(c_uv[1]))
+                        if 0 <= u < img_w and 0 <= v < img_h:
+                            cv2.circle(debug_img, (u, v), 3, (0, 255, 0), -1)
 
                 info_text = f"{label} [35cm] | d={dist:.2f}m (x={obj_x:.2f}, y={obj_y:.2f}, z={obj_z:.2f}) [{len(cluster_cam_pts)}pts]"
                 cv2.putText(debug_img, info_text, (x1, max(y1 - 10, 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 0), 2, cv2.LINE_AA)
@@ -663,11 +720,13 @@ class LidarCamFusionNode(Node):
                 best_obj['distance'],
                 best_obj['label']
             )
-            self.publish_cube_marker(
-                best_obj['pos_cam'],
-                msg.header.stamp,
-                best_obj['label']
-            )
+            for m_id, obj in enumerate(detected_objects_3d):
+                self.publish_cube_marker(
+                    obj['pos_cam'],
+                    msg.header.stamp,
+                    obj['label'],
+                    marker_id=m_id
+                )
 
         if HAS_PC2 and cluster_all_pts:
             merged_cluster_pts = np.vstack(cluster_all_pts)
@@ -957,15 +1016,16 @@ class LidarCamFusionNode(Node):
             throttle_duration_sec=0.5
         )
 
-    def publish_cube_marker(self, pos_cam: Tuple[float, float, float], stamp, label: str):
+    def publish_cube_marker(self, pos_cam: Tuple[float, float, float], stamp, label: str, marker_id: int = 0):
         """
         Publikasikan Marker 3D kubus 35x35x35 cm ke /fusion/object_marker untuk visualisasi di RViz2.
+        Mendukung multi-marker dengan marker_id unik untuk setiap kardus (tumpukan).
         """
         marker = Marker()
         marker.header.stamp = stamp
         marker.header.frame_id = self.cam_frame
         marker.ns = "detected_cube_35cm"
-        marker.id = 0
+        marker.id = marker_id
         marker.type = Marker.CUBE
         marker.action = Marker.ADD
 
@@ -980,11 +1040,17 @@ class LidarCamFusionNode(Node):
         marker.scale.y = 0.35
         marker.scale.z = 0.35
 
-        # Warna merah semi-transparan
-        marker.color.r = 1.0
-        marker.color.g = 0.1
-        marker.color.b = 0.1
-        marker.color.a = 0.7
+        # Warna merah semi-transparan (target utama merah cerah, target sekunder jingga-merah)
+        if marker_id == 0:
+            marker.color.r = 1.0
+            marker.color.g = 0.1
+            marker.color.b = 0.1
+            marker.color.a = 0.8
+        else:
+            marker.color.r = 1.0
+            marker.color.g = 0.4
+            marker.color.b = 0.1
+            marker.color.a = 0.65
 
         marker.lifetime = rclpy.duration.Duration(seconds=0.5).to_msg()
         self.pub_marker.publish(marker)
