@@ -432,6 +432,7 @@ class LidarCamFusionNode(Node):
         self.pub_object_point = self.create_publisher(PointStamped, '/fusion/object_point', 10)
         self.pub_marker = self.create_publisher(Marker, '/fusion/object_marker', 10)
         self.pub_debug = self.create_publisher(Image, '/fusion/debug', 10)
+        self.pub_hsv_mask = self.create_publisher(Image, '/fusion/hsv_mask', 10)
         self.pub_cluster_cloud = self.create_publisher(PointCloud2, '/fusion/cluster_cloud', 10)
         self.pub_roi_cloud = self.create_publisher(PointCloud2, '/fusion/roi_cloud', 10)
         self.pub_fov_lidar = self.create_publisher(PointCloud2, '/fusion/fov_lidar_cloud', 10)
@@ -632,12 +633,21 @@ class LidarCamFusionNode(Node):
         img_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
         # 1. Deteksi 2D
-        bboxes, latency_ms = self.detect_objects(cv_img)
+        bboxes, latency_ms, mask_img = self.detect_objects(cv_img)
         if latency_ms >= 0:
             self.get_logger().info(
                 f"[{self.detector_type.upper()}] Latensi: {latency_ms:.2f} ms | Target terdeteksi: {len(bboxes)}",
                 throttle_duration_sec=2.0
             )
+
+        # Publikasikan topik preview mask HSV / segmentasi (tanpa membuka window GUI baru)
+        if mask_img is not None:
+            try:
+                mask_msg = self.bridge.cv2_to_imgmsg(mask_img, encoding='mono8')
+                mask_msg.header = msg.header
+                self.pub_hsv_mask.publish(mask_msg)
+            except Exception as e:
+                self.get_logger().error(f"Gagal publish HSV mask image: {e}", throttle_duration_sec=5.0)
 
         # 2. Ambil titik LiDAR dari buffer
         t_target = img_time + self.time_offset
@@ -773,15 +783,17 @@ class LidarCamFusionNode(Node):
                     )
                     self.gui_warned = True
 
-    def detect_objects(self, img_bgr: np.ndarray) -> Tuple[List[dict], float]:
-        """Deteksi 2D dengan Corner 3D, YOLO, atau fallback HSV."""
+    def detect_objects(self, img_bgr: np.ndarray) -> Tuple[List[dict], float, Optional[np.ndarray]]:
+        """Deteksi 2D dengan Corner 3D, YOLO, atau fallback HSV. Mengembalikan (results, latency_ms, mask_img)."""
         results = []
         latency_ms = -1.0
+        mask_img = None
 
         if self.detector_type in ['corner', 'corner3d'] and self.cube_detector is not None:
             t0 = time.perf_counter()
             dets, mask_clean = self.cube_detector.detect(img_bgr)
             latency_ms = (time.perf_counter() - t0) * 1000.0
+            mask_img = mask_clean
 
             for d in dets:
                 results.append({
@@ -794,7 +806,7 @@ class LidarCamFusionNode(Node):
                     'pnp_dist': d['distance_m'],
                     'pnp_pos': d['pos_3d_m']
                 })
-            return results, latency_ms
+            return results, latency_ms, mask_img
 
         if self.detector_type == 'yolo' and self.yolo_model is not None:
             t0 = time.perf_counter()
@@ -819,7 +831,7 @@ class LidarCamFusionNode(Node):
                             'label': cls_name,
                             'score': score
                         })
-            return results, latency_ms
+            return results, latency_ms, None
 
         # Fallback HSV
         t0 = time.perf_counter()
@@ -831,6 +843,7 @@ class LidarCamFusionNode(Node):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask_img = mask
 
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for cnt in contours:
@@ -842,7 +855,7 @@ class LidarCamFusionNode(Node):
                     'score': 1.0
                 })
         latency_ms = (time.perf_counter() - t0) * 1000.0
-        return results, latency_ms
+        return results, latency_ms, mask_img
 
     def get_lidar_points_in_window(self, t_start: float, t_end: float) -> np.ndarray:
         """Mengambil titik LiDAR dalam rentang waktu buffer."""
