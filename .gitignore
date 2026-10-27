@@ -1,0 +1,23 @@
+# ==========================================
+# HASIL PRODUKSI / BINDING ROS 2 (COLCON)
+# ==========================================
+build/
+install/
+log/
+
+# ==========================================
+# PYTHON RUNTIME & CACHE
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+env/
+
+# ==========================================
+# VS CODE CACHE & DATABASE
+# ==========================================
+.vscode/*.db*
+.vscode/*.lock
+.vscode/ipch/

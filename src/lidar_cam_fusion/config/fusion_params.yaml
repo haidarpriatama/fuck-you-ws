@@ -1,0 +1,82 @@
+/**:
+  ros__parameters:
+    # -------------------------------------------------------------
+    # PENGATURAN HARDWARE KAMERA (Logitech MX Brio)
+    # -------------------------------------------------------------
+    video_device: "/dev/video2"           # Jalur device atau index kamera (/dev/video2 atau 2)
+    image_width: 1280
+    image_height: 720
+    fps: 30.0
+
+    # -------------------------------------------------------------
+    # PENGATURAN DETEKTOR
+    # -------------------------------------------------------------
+    detector: "yolo"                      # Opsi: 'yolo' atau 'hsv'
+    model: "/home/haidar/ros2_ws/models/best11n.pt"
+    target_class: "R"                     # Kelas target: 'R' (Red box)
+    conf: 0.45                            # Ambang batas kepercayaan deteksi YOLO
+
+    # -------------------------------------------------------------
+    # TOPIK DAN FRAME
+    # -------------------------------------------------------------
+    image_topic: "/image_raw"             # Topik gambar dari kamera (Logitech MX Brio)
+    lidar_topic: "/livox/lidar"           # Topik titik LiDAR (livox_ros_driver2/msg/CustomMsg)
+    cam_frame: "camera_optical_frame"     # Frame koordinat kamera
+    base_frame: "base_link"               # Frame koordinat robot
+    enable_tf: false                      # Aktifkan jika ingin mentransformasikan ke base_link via TF2
+
+    # -------------------------------------------------------------
+    # PREVIEW & VISUALISASI
+    # -------------------------------------------------------------
+    show_preview: false                   # Matikan jendela pop-up OpenCV GUI (fokus visualisasi di RViz2)
+
+    # -------------------------------------------------------------
+    # BUFFER & AKUMULASI SCAN
+    # -------------------------------------------------------------
+    window_s: 0.45                        # Akumulasi 450 ms titik LiDAR Livox (agar titik di kardus rapat)
+    time_offset: 0.0                      # Selisih waktu transfer kamera vs lidar (detik)
+
+    # -------------------------------------------------------------
+    # FILTER BOUNDING BOX & 1D DEPTH CLUSTERING
+    # Berdasarkan metodologi Darshan Bhanushali & Fritz AI Point Fusion
+    # -------------------------------------------------------------
+    shrink: 0.08                          # Fraksi penyusutan 8% (cukup untuk memotong background edge)
+    gap: 0.25                             # Jarak toleransi pengelompokan kedalaman 1D (meter)
+    min_pts: 3                            # Jumlah titik minimum untuk kluster objek yang valid
+    max_extent: 0.50                      # Batas toleransi dimensi fisik 3D kubus (meter)
+    min_range: 0.35                       # Filter blind zone Livox Mid-360 & sasis robot (meter)
+
+    # -------------------------------------------------------------
+    # KOMPENSASI KEMIRINGAN BRACKET LIDAR (PITCH TILT)
+    # -------------------------------------------------------------
+    # Berdasarkan desain CAD bracket:
+    # LiDAR menunduk 33 derajat ke arah depan kamera -> lidar_pitch_deg: -33.0
+    lidar_pitch_deg: -33.0
+
+    # -------------------------------------------------------------
+    # PARAMETER KALIBRASI (K, D, R_cl, t_cl)
+    # Konvensi Transformasi: p_cam = R_cl @ p_lidar + t_cl
+    # Livox: X maju, Y kiri, Z atas
+    # Kamera: X kanan, Y bawah, Z maju
+    # -------------------------------------------------------------
+    # Intrinsik Kamera: K [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+    K: [
+      775.1078, 0.0, 617.6829,
+      0.0, 770.2547, 340.3842,
+      0.0, 0.0, 1.0
+    ]
+
+    # Distorsi Lensa: D [k1, k2, p1, p2, k3]
+    D: [0.1026, -0.1739, -0.0117, -0.0025, 0.0]
+
+    # Rotasi Ekstrinsik LiDAR -> Kamera (Kamera menghadap KANAN LiDAR)
+    # X_c = -X_l (kanan), Y_c = -Z_l (bawah), Z_c = -Y_l (maju)
+    R_cl: [
+      -1.0,  0.0,  0.0,
+       0.0,  0.0, -1.0,
+       0.0, -1.0,  0.0
+    ]
+
+    # Ekstrinsik Translasi LiDAR -> Kamera: t_cl [tx, ty, tz] dalam meter
+    # Dari CAD: vertical delta = 82.323 mm, horizontal delta = 11.043 mm
+    t_cl: [0.0, 0.0823, -0.0110]

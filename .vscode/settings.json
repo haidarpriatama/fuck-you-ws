@@ -1,0 +1,18 @@
+{
+    "ROS2.distro": "humble",
+    "cmake.sourceDirectory": "/home/haidar/ros2_ws/BR27 Assem Base V2",
+    "python.autoComplete.extraPaths": [
+        "/home/haidar/ros2_ws/install/robot2_sim/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/haidar/ros2_ws/install/robot2_sim/lib/python3.10/site-packages",
+        "/opt/ros/humble/lib/python3.10/site-packages",
+        "/opt/ros/humble/local/lib/python3.10/dist-packages"
+    ],
+    "urdf-visualizer.packages": {
+        "robot2_sim": "${workspaceFolder}/src/robot2_sim",
+        "BR27 Assem Base V2": "${workspaceFolder}/BR27 Assem Base V2"
+    }
+}
